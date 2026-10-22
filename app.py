@@ -63,7 +63,7 @@ def lot_round(x,lot):
     return np.sign(x)*np.floor(np.abs(x)/lot+0.5)*lot
 
 @st.cache_data(show_spinner=False, max_entries=12)
-def simulate(S0, endpoint, n, expiry_years, K, r, q, iv, forecast_vol, call, signed_contracts, multiplier, initial_shares, initial_stock_price, min_shares, cost, lot, seed):
+def simulate(S0, endpoint, n, valuation_dates, expiry_date, K, r, q, iv, forecast_vol, call, signed_contracts, multiplier, initial_shares, initial_stock_price, min_shares, cost, lot, seed):
     rng=np.random.default_rng(seed)
     if n==0:
         paths=np.full((100,1),S0,dtype=float)
@@ -79,7 +79,7 @@ def simulate(S0, endpoint, n, expiry_years, K, r, q, iv, forecast_vol, call, sig
     cash=np.full(100,-float(initial_shares)*initial_stock_price)
     last=shares.copy()
     for day in range(1,n+1):
-        remaining=max(expiry_years-day/252,0)
+        remaining=max(max((expiry_date - valuation_dates[day]).days/365, 0),0)
         _,d,_,_,_=bs(paths[:,day],K,remaining,r,q,iv,call)
         target=-signed_contracts*multiplier*d
         threshold=np.maximum(0.25*np.abs(last),min_shares)
@@ -91,6 +91,55 @@ def simulate(S0, endpoint, n, expiry_years, K, r, q, iv, forecast_vol, call, sig
         last=np.where(trigger,shares,last)
     # Liquidation-value P/L; do not charge hypothetical liquidation cost.
     return float(np.mean(cash+shares*endpoint)), float(np.std(cash+shares*endpoint,ddof=1)), float(np.mean(shares)), paths
+
+# JPX official holiday list, cached for 24 hours. Fail closed if unavailable.
+@st.cache_data(ttl=86400, show_spinner=False)
+def jpx_holidays(years):
+    import requests
+    import re
+    from html.parser import HTMLParser
+
+    class CellReader(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.depth = 0
+            self.parts = []
+            self.cells = []
+        def handle_starttag(self, tag, attrs):
+            if tag in ('td', 'th'):
+                self.depth += 1
+                if self.depth == 1:
+                    self.parts = []
+        def handle_data(self, data):
+            if self.depth:
+                self.parts.append(data)
+        def handle_endtag(self, tag):
+            if tag in ('td', 'th') and self.depth:
+                self.depth -= 1
+                if self.depth == 0:
+                    self.cells.append(''.join(self.parts).strip())
+
+    url = 'https://www.jpx.co.jp/corporate/about-jpx/calendar/index.html'
+    response = requests.get(url, timeout=15, headers={'User-Agent':'Mozilla/5.0'})
+    response.raise_for_status()
+    parser = CellReader()
+    parser.feed(response.text)
+    holidays = set()
+    for cell in parser.cells:
+        for match in re.finditer(r'(20\d{2})\s*[/年.-]\s*(\d{1,2})\s*[/月.-]\s*(\d{1,2})\s*日?', cell):
+            try:
+                d = dt.date(*map(int, match.groups()))
+                if d.year in years:
+                    holidays.add(d)
+            except ValueError:
+                continue
+    if not holidays or not all(any(d.year == year for d in holidays) for year in years):
+        raise ValueError('JPX休業日一覧を取得・検証できませんでした。')
+    return holidays
+
+def trading_dates(entry, expiry, holidays):
+    return [d.date() for d in pd.date_range(entry, expiry, freq='D')
+            if d.weekday() < 5 and d.date() not in holidays]
 
 with st.container(border=True):
     st.subheader('初期ポジション設定')
@@ -122,9 +171,20 @@ with st.container(border=True):
 
 if expiry<=entry:
     st.error('満期日は建て日より後にしてください。'); st.stop()
-all_days=pd.bdate_range(entry,expiry)
-# Count business days after entry through expiry, using weekday approximation (not exchange holiday calendar).
-remaining_days=max(len(all_days)-int(entry.weekday()<5),1)
+try:
+    holidays=jpx_holidays(tuple(range(entry.year, expiry.year+1)))
+except Exception as exc:
+    st.error(f'JPX営業日カレンダーの自動取得に失敗しました: {exc}')
+    st.stop()
+market_dates=trading_dates(entry, expiry, holidays)
+if entry not in market_dates or expiry not in market_dates:
+    st.error('建て日と満期日はJPXの営業日を指定してください（現時点では非営業日を指定できません）。')
+    st.stop()
+valuation_dates=market_dates[market_dates.index(entry):]
+remaining_days=len(valuation_dates)-1
+if remaining_days<1:
+    st.error('建て日と満期日の間に評価可能な営業日がありません。')
+    st.stop()
 signed_contracts=contracts*(1 if side=='買' else -1)
 initial_shares=stock_qty*(1 if stock_side=='買' else -1)
 call=kind=='Call'; iv=iv_pct/100; fv=forecast_pct/100;r=r_pct/100;q=q_pct/100
@@ -162,7 +222,7 @@ with st.container(border=True):
         day=st.number_input('経過営業日を直接入力', min_value=0,
                             max_value=remaining_days, step=1, key='eval_day_number',
                             on_change=sync_day_from_number)
-        st.caption(f'建て日: {entry} / 満期日: {expiry} / 評価日目安: {pd.Timestamp(entry)+pd.offsets.BDay(day):%Y-%m-%d}')
+        st.caption(f'建て日: {entry} / 満期日: {expiry} / 評価日目安: {pd.Timestamp(valuation_dates[day]):%Y-%m-%d}')
     with y:
         min_s=1
         max_s=100000
@@ -174,13 +234,13 @@ with st.container(border=True):
 
 # Calendar-year remaining maturity; time progresses in trading days approximated by 252/year.
 expiry_T=max((expiry-entry).days/365,1/365)
-T=max(expiry_T-day/252,0)
+T=max((expiry-valuation_dates[day]).days/365,0)
 price,delta,gamma,vega,theta=bs(target,K,T,r,q,iv,call)
 option_pl=float(signed_contracts*multiplier*(price-premium))
 if day==0:
     stock_pl=float(initial_shares*(target-stock_entry)); stock_std=0; avg_shares=initial_shares
 else:
-    stock_pl,stock_std,avg_shares,_=simulate(S0,float(target),day,expiry_T,K,r,q,iv,fv,call,signed_contracts,multiplier,initial_shares,stock_entry,min_shares,cost,100,seed)
+    stock_pl,stock_std,avg_shares,_=simulate(S0,float(target),day,tuple(valuation_dates[:day+1]),expiry,K,r,q,iv,fv,call,signed_contracts,multiplier,initial_shares,stock_entry,min_shares,cost,100,seed)
 net_pl=option_pl+stock_pl
 m1,m2,m3,m4=st.columns(4)
 m1.metric('オプション損益',f'{option_pl:+,.0f} 円')
@@ -205,7 +265,7 @@ with st.spinner('条件付き株価経路とヘッジ損益を計算中...'):
         if day==0:
             stock_curve.append(initial_shares*(v-stock_entry))
         else:
-            stock_curve.append(simulate(S0,float(v),day,expiry_T,K,r,q,iv,fv,call,signed_contracts,multiplier,initial_shares,stock_entry,min_shares,cost,100,seed)[0])
+            stock_curve.append(simulate(S0,float(v),day,tuple(valuation_dates[:day+1]),expiry,K,r,q,iv,fv,call,signed_contracts,multiplier,initial_shares,stock_entry,min_shares,cost,100,seed)[0])
 stock_curve=np.asarray(stock_curve)
 series=[('オプション損益',option_curve,option_pl,'円'),('現物ヘッジ損益',stock_curve,stock_pl,'円'),('デルタ',signed_contracts*multiplier*deltas,float(signed_contracts*multiplier*delta),'株相当'),('セータ',signed_contracts*multiplier*thetas,float(signed_contracts*multiplier*theta),'円/日'),('ベガ',signed_contracts*multiplier*vegas,float(signed_contracts*multiplier*vega),'円/IV 1pt'),('ガンマ',signed_contracts*multiplier*gammas,float(signed_contracts*multiplier*gamma),'デルタ株数/円')]
 st.subheader('損益・グリークス（横軸：原資産価格）')
@@ -222,7 +282,7 @@ for i in range(0,6,2):
 
 # Replay one of the *same* conditional paths used for the selected endpoint.
 # This is an audit trail, not the 100-path mean displayed above.
-def replay_hedge_path(path, expiry_years, K, r, q, iv, call, signed_contracts,
+def replay_hedge_path(path, valuation_dates, expiry_date, K, r, q, iv, call, signed_contracts,
                       multiplier, initial_shares, initial_stock_price, min_shares,
                       cost, lot):
     held=float(initial_shares)
@@ -231,7 +291,7 @@ def replay_hedge_path(path, expiry_years, K, r, q, iv, call, signed_contracts,
     rows=[]
     for d,S in enumerate(path):
         S=float(S)
-        remaining=max(expiry_years-d/252,0)
+        remaining=max((expiry_date-valuation_dates[d]).days/365,0)
         _,option_delta,_,_,_=bs(S,K,remaining,r,q,iv,call)
         required=float(-signed_contracts*multiplier*option_delta)
         threshold=max(.25*abs(last),float(min_shares))
@@ -269,10 +329,10 @@ if day==0:
     selected_path=np.array([S0],dtype=float)
 else:
     # Reuse the cached simulation to guarantee matching random paths and P/L.
-    _,_,_,all_paths=simulate(S0,float(target),day,expiry_T,K,r,q,iv,fv,call,
+    _,_,_,all_paths=simulate(S0,float(target),day,tuple(valuation_dates[:day+1]),expiry,K,r,q,iv,fv,call,
         signed_contracts,multiplier,initial_shares,stock_entry,min_shares,cost,100,seed)
     selected_path=all_paths[int(path_number)-1]
-history=replay_hedge_path(selected_path,expiry_T,K,r,q,iv,call,signed_contracts,
+history=replay_hedge_path(selected_path,tuple(valuation_dates[:day+1]),expiry,K,r,q,iv,call,signed_contracts,
     multiplier,initial_shares,stock_entry,min_shares,cost,100)
 trade_count=int((history['売買株数（＋買／−売）']!=0).sum())
 volume=int(history['売買株数（＋買／−売）'].abs().sum())
@@ -292,30 +352,6 @@ with st.expander('評価の前提・注意点（必ず確認）'):
 - 25%乖離または最低株数の大きい方でヘッジ発動。目標株数を**100株単位**に四捨五入（中間は絶対値で切り上げ）。ヘッジ後もデルタが残る場合があります。
 - 現物損益は初期建値からの評価損益に、日次ヘッジ売買キャッシュフローと1株当たり取引コストを反映します。オプション損益は入力建値からの時価評価です。
 - 金利・配当利回りはBS評価に使いますが、現物在庫の資金調達費用・配当受払・オプション売買手数料は**現物PLに含みません**。実務のネットPLでは別途必要です。
-- 営業日は**土日を除く平日近似**です。日本の祝日・取引所休業日を完全には反映していません。
-
-st.divider()
-
-with st.expander("免責事項 / Disclaimer"):
-    st.markdown("""
-### 免責事項
-
-本シミュレーターは、株式オプション取引およびダイナミックデルタヘッジ戦略の研究・教育・分析を目的としています。投資助言または特定の金融商品の売買推奨を目的とするものではありません。
-
-表示されるオプション価格、グリークス、損益およびヘッジ履歴は、数理モデルと入力条件に基づく理論値・推計値です。実際の取引成果とは異なる場合があります。
-
-計算結果の正確性、完全性、将来の収益性は保証されません。投資判断は利用者自身の責任で行ってください。
-
----
-
-### Disclaimer
-
-This simulator is provided for research, educational, and analytical purposes only. It does not constitute investment advice or a recommendation to trade any financial instrument.
-
-Option prices, Greeks, profit and loss figures, and hedging histories are theoretical or estimated results based on mathematical models and user-defined assumptions. Actual trading outcomes may differ materially.
-
-The accuracy, completeness, and future profitability of the results are not guaranteed. Users are solely responsible for their own investment decisions.
-""")
-
+- 営業日はJPX公式休業日一覧から取得し、土日と休業日を除きます。残存期間とセータは暦日/365で評価します。
 - 株価グラフの現物PLは、**各横軸株価を終点とする別々の条件付き100経路の平均**です。スライダーを動かしても同一経路の実現PLが変化するという意味ではありません。
 - 100経路の推定にはモンテカルロ誤差があります。決算イベント、IVスマイル、板の流動性、スリッページ等は再現していません。''')
