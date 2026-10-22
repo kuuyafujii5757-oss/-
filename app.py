@@ -355,3 +355,57 @@ with st.expander('評価の前提・注意点（必ず確認）'):
 - 営業日はJPX公式休業日一覧から取得し、土日と休業日を除きます。残存期間とセータは暦日/365で評価します。
 - 株価グラフの現物PLは、**各横軸株価を終点とする別々の条件付き100経路の平均**です。スライダーを動かしても同一経路の実現PLが変化するという意味ではありません。
 - 100経路の推定にはモンテカルロ誤差があります。決算イベント、IVスマイル、板の流動性、スリッページ等は再現していません。''')
+
+
+st.divider()
+
+with st.expander("免責事項 / Disclaimer"):
+    st.markdown("""
+### 免責事項
+
+本シミュレーターは、オプション取引および
+ダイナミックデルタヘッジ戦略の研究・教育を
+目的として提供されています。
+
+本シミュレーターによる計算結果、損益予測、
+グリークスおよびシミュレーション結果は、
+一定の仮定に基づく理論値であり、
+実際の市場価格や将来の投資成果を
+保証するものではありません。
+
+実際の取引では、流動性、スプレッド、
+スリッページ、取引コスト、市場環境の変化等により、
+計算結果と実際の損益が大きく異なる場合があります。
+
+本シミュレーターは投資助言や特定の金融商品の
+売買を推奨するものではありません。
+
+本シミュレーターの利用および投資判断は、
+利用者ご自身の責任において行ってください。
+
+---
+
+### Disclaimer
+
+This simulator is provided for educational and
+research purposes relating to options trading
+and dynamic delta hedging strategies.
+
+All calculations, profit and loss estimates,
+Greeks, and simulation results are theoretical
+and based on simplified assumptions.
+
+They do not represent actual market prices
+or guarantee future investment performance.
+
+Actual trading results may differ materially
+due to liquidity, bid-ask spreads, slippage,
+transaction costs, and changing market conditions.
+
+Nothing in this simulator constitutes investment
+advice or a recommendation to buy or sell
+any financial instrument.
+
+Users are solely responsible for their own
+investment decisions and use of this simulator.
+""")
